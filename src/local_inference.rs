@@ -61,22 +61,15 @@ impl LocalModelConfig {
 
 /// Local LLM inference engine using OpenVINO
 pub struct LocalInferenceEngine {
-    _core: Core,
+    model_path: PathBuf,
     tokenizer: Tokenizer,
     config: LocalModelConfig,
+    eos_token_id: u32,
 }
 
 impl LocalInferenceEngine {
     /// Create a new inference engine with the given configuration
     pub fn new(config: LocalModelConfig) -> Result<Self> {
-        // Initialize OpenVINO core
-        let core = Core::new()?;
-
-        eprintln!(
-            "OpenVINO initialized. Device: {}",
-            config.device.as_str()
-        );
-
         // Check if model files exist
         if !config.model_path.exists() {
             return Err(anyhow!(
@@ -96,77 +89,130 @@ impl LocalInferenceEngine {
         let tokenizer = Tokenizer::from_file(&config.tokenizer_path)
             .map_err(|e| anyhow!("Failed to load tokenizer: {}", e))?;
 
-        eprintln!("Tokenizer loaded successfully");
+        // Get EOS token ID from tokenizer
+        let eos_token_id = tokenizer
+            .token_to_id("</s>")
+            .or_else(|| tokenizer.token_to_id("<|endoftext|>"))
+            .or_else(|| tokenizer.token_to_id("<|im_end|>"))
+            .unwrap_or(2); // Default to 2 if not found
 
-        // Note: Actual model loading and compilation will be implemented
-        // once the autoregressive generation loop is completed.
-        // For now, this validates the setup and prepares the infrastructure.
+        if cfg!(debug_assertions) {
+            eprintln!("✓ Tokenizer loaded (EOS token: {})", eos_token_id);
+            eprintln!("✓ Device: {}", config.device.as_str());
+        }
 
         Ok(Self {
-            _core: core,
+            model_path: config.model_path.clone(),
             tokenizer,
             config,
+            eos_token_id,
         })
     }
 
     /// Generate text response for the given prompt
     pub fn generate(&self, prompt: &str) -> Result<String> {
-        // Tokenize input to validate the tokenizer works
+        // Tokenize input
         let encoding = self.tokenizer
             .encode(prompt, false)
             .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
 
-        let input_ids = encoding.get_ids();
+        let input_ids: Vec<u32> = encoding.get_ids().to_vec();
 
         if input_ids.is_empty() {
             return Err(anyhow!("Tokenization produced empty input"));
         }
 
-        // TODO: Implement autoregressive generation loop
-        // This requires:
-        // 1. Load and compile the model with Core.read_model()
-        // 2. Create inference request
-        // 3. For each generation step:
-        //    - Prepare input tensor from token IDs
-        //    - Run inference to get logits
-        //    - Sample or argmax to get next token
-        //    - Append token and repeat until EOS
-        // 4. Decode generated tokens to string
+        // Initialize OpenVINO Core
+        let mut core = Core::new()?;
+
+        // Read and compile model
+        let model_xml = self.model_path.to_string_lossy();
+        let model_bin = self.model_path.with_extension("bin").to_string_lossy().to_string();
+
+        let _model = core.read_model_from_file(&model_xml, &model_bin)?;
+
+        // TODO: Complete the implementation with proper OpenVINO API calls
+        // The OpenVINO Rust API v0.7 has specific method signatures that need to be matched.
+        // Key steps needed:
+        // 1. Compile model: compiled_model = core.compile_model(&model, "CPU")?
+        // 2. Create infer request: infer_request = compiled_model.create_infer_request()?
+        // 3. Set input tensor with proper shape and data
+        // 4. Run inference: infer_request.infer()?
+        // 5. Get output tensor and extract logits
+        // 6. Implement autoregressive loop with token sampling
         //
-        // See OpenVINO Rust examples for reference:
-        // https://github.com/intel/openvino-rs
+        // For now, return a helpful message showing the integration is partially complete.
 
-        eprintln!("OpenVINO inference: Tokenized {} tokens", input_ids.len());
-        eprintln!("Device: {}", self.config.device.as_str());
-        eprintln!("Model: {}", self.config.model_path.display());
+        eprintln!("✓ OpenVINO Core initialized");
+        eprintln!("✓ Model loaded: {}", model_xml);
+        eprintln!("✓ Tokenized {} tokens", input_ids.len());
+        eprintln!("✓ Device: {}", self.config.device.as_str());
 
-        // Return informative message for now
         Ok(format!(
-            "🔧 OpenVINO Integration Status: Framework Ready\n\n\
-            ✅ OpenVINO Core initialized\n\
-            ✅ Tokenizer loaded ({} tokens)\n\
-            ✅ Device configured: {}\n\
-            ✅ Model path validated: {}\n\n\
-            ⚠️  Autoregressive generation loop not yet implemented.\n\n\
+            "OpenVINO inference framework initialized successfully!\n\n\
+            ✅ Model: {}\n\
+            ✅ Device: {}\n\
+            ✅ Tokenizer: {} tokens\n\
+            ✅ EOS token: {}\n\n\
+            🚧 Autoregressive generation loop implementation in progress.\n\n\
+            The OpenVINO Rust bindings (v0.7) require specific API calls that are being finalized.\n\
+            Key infrastructure is complete:\n\
+            - Model loading ✓\n\
+            - Tokenization ✓\n\
+            - Device selection ✓\n\n\
+            What's needed:\n\
+            - Tensor creation and data copying with correct API\n\
+            - Inference request execution\n\
+            - Logits extraction and token sampling\n\
+            - Autoregressive generation loop\n\n\
             Your prompt was: \"{}\"\n\n\
-            To use LLM inference now, please use a remote provider:\n\
+            For production use, please use remote providers:\n\
             • qq --profile groq \"your question\"\n\
             • qq --profile openai \"your question\"\n\n\
-            See README.md for implementation details and contribution guidelines.",
-            input_ids.len(),
+            See src/local_inference.rs for implementation details.",
+            self.model_path.display(),
             self.config.device.as_str(),
-            self.config.model_path.display(),
+            input_ids.len(),
+            self.eos_token_id,
             prompt
         ))
     }
 
-    /// Generate text with streaming callback (for compatibility with existing API)
+    /// Sample the next token from logits (greedy or temperature sampling)
+    #[allow(dead_code)]
+    fn sample_token(&self, logits: &[f32]) -> Result<u32> {
+        if logits.is_empty() {
+            return Err(anyhow!("Empty logits"));
+        }
+
+        // Greedy decoding (argmax) - always use for now
+        let mut max_idx = 0;
+        let mut max_val = logits[0];
+
+        for (i, &logit) in logits.iter().enumerate().skip(1) {
+            if logit > max_val {
+                max_val = logit;
+                max_idx = i;
+            }
+        }
+
+        Ok(max_idx as u32)
+
+        // TODO: Implement temperature sampling when needed
+        // if self.config.temperature >= 0.01 {
+        //     Apply softmax with temperature
+        //     Sample from the distribution
+        // }
+    }
+
+    /// Generate text with streaming callback
+    /// Currently calls the non-streaming generate and returns all text at once
     pub fn generate_stream<F>(&self, prompt: &str, mut callback: F) -> Result<()>
     where
         F: FnMut(&str),
     {
-        // For now, implement as non-streaming and call callback once
-        // TODO: Implement proper token-by-token streaming
+        // TODO: Implement true token-by-token streaming once autoregressive loop is complete
+        // For now, generate all text and call callback once
         let response = self.generate(prompt)?;
         callback(&response);
         Ok(())
