@@ -29,6 +29,15 @@ pub struct ModelProvider {
     /// Optional inline api key in config. Env var takes precedence only if this is absent.
     #[serde(default)]
     pub api_key: Option<String>,
+    /// If true, this provider uses local inference with OpenVINO
+    #[serde(default)]
+    pub local: bool,
+    /// Device to use for local inference (CPU, GPU, or NPU)
+    #[serde(default)]
+    pub device: Option<String>,
+    /// HuggingFace model repository ID for local models
+    #[serde(default)]
+    pub repo_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +73,9 @@ impl Default for Config {
                 base_url: "https://api.openai.com/v1".to_string(),
                 env_key: "OPENAI_API_KEY".to_string(),
                 api_key: None,
+                local: false,
+                device: None,
+                repo_id: None,
             },
         );
         model_providers.insert(
@@ -73,6 +85,9 @@ impl Default for Config {
                 base_url: "https://api.groq.com/openai/v1".to_string(),
                 env_key: "GROQ_API_KEY".to_string(),
                 api_key: None,
+                local: false,
+                device: None,
+                repo_id: None,
             },
         );
         model_providers.insert(
@@ -82,6 +97,21 @@ impl Default for Config {
                 base_url: "https://api.anthropic.com/v1".to_string(),
                 env_key: "ANTHROPIC_API_KEY".to_string(),
                 api_key: None,
+                local: false,
+                device: None,
+                repo_id: None,
+            },
+        );
+        model_providers.insert(
+            "local".to_string(),
+            ModelProvider {
+                name: "Local (OpenVINO)".to_string(),
+                base_url: "".to_string(),
+                env_key: "".to_string(),
+                api_key: None,
+                local: true,
+                device: Some("NPU".to_string()),
+                repo_id: Some("Qwen/Qwen2.5-3B-Instruct-openvino".to_string()),
             },
         );
 
@@ -107,6 +137,13 @@ impl Default for Config {
                 model: "claude-3-5-sonnet-20241022".to_string(),
             },
         );
+        profiles.insert(
+            "local".to_string(),
+            Profile {
+                model_provider: "local".to_string(),
+                model: "qwen2.5-3b-instruct".to_string(),
+            },
+        );
 
         Self {
             default_profile: "groq".to_string(),
@@ -126,6 +163,9 @@ pub struct EffectiveProfile {
     pub model: String,
     pub base_url: String,
     pub api_key: String,
+    pub local: bool,
+    pub device: Option<String>,
+    pub repo_id: Option<String>,
 }
 
 impl Config {
@@ -225,8 +265,10 @@ impl Config {
         let model = model_override.unwrap_or(&profile.model).to_string();
         let base_url = provider.base_url.clone();
 
-        // Prefer inline api_key; else env var per env_key.
-        let api_key = if let Some(k) = provider.api_key.clone() {
+        // Prefer inline api_key; else env var per env_key (skip for local models).
+        let api_key = if provider.local {
+            String::new() // No API key needed for local inference
+        } else if let Some(k) = provider.api_key.clone() {
             k
         } else {
             std::env::var(&provider.env_key).map_err(|_| {
@@ -243,6 +285,9 @@ impl Config {
             model,
             base_url,
             api_key,
+            local: provider.local,
+            device: provider.device.clone(),
+            repo_id: provider.repo_id.clone(),
         })
     }
 
@@ -270,10 +315,11 @@ impl Config {
 
         println!("qqqa init — set up your provider and API key");
         println!("\nChoose default profile:");
-        println!("  [1] Groq  — openai/gpt-oss-20b (fast, cheap)");
-        println!("  [2] OpenAI — gpt-5-mini (slower, a bit smarter)");
-        println!("  [3] Anthropic — claude-3-5-sonnet-20241022 (Claude by Anthropic)");
-        print!("Enter 1, 2, or 3 [1]: ");
+        println!("  [1] Groq  — openai/gpt-oss-20b (fast, cheap, remote)");
+        println!("  [2] OpenAI — gpt-5-mini (slower, a bit smarter, remote)");
+        println!("  [3] Anthropic — claude-3-5-sonnet-20241022 (Claude by Anthropic, remote)");
+        println!("  [4] Local — Qwen2.5-3B-Instruct (local inference with OpenVINO + NPU)");
+        print!("Enter 1, 2, 3, or 4 [1]: ");
         io::stdout().flush().ok();
         let mut choice = String::new();
         io::stdin().read_line(&mut choice).ok();
@@ -281,10 +327,11 @@ impl Config {
         match choice {
             "2" | "openai" => cfg.default_profile = "openai".to_string(),
             "3" | "anthropic" => cfg.default_profile = "anthropic".to_string(),
+            "4" | "local" => cfg.default_profile = "local".to_string(),
             _ => cfg.default_profile = "groq".to_string(),
         }
 
-        // Ask for API key for the chosen provider (optional).
+        // Ask for API key for the chosen provider (optional) - skip for local models.
         let provider_key = cfg.default_profile.clone();
         let provider = cfg
             .model_providers
@@ -292,29 +339,34 @@ impl Config {
             .ok_or_else(|| anyhow!("Internal error: missing provider {}", provider_key))?
             .clone();
 
-        let env_hint = provider.env_key.clone();
-        println!(
-            "\nEnter {} (optional). Leave empty to use env var {}.",
-            provider.name, env_hint
-        );
-        print!("{}: ", provider.name);
-        io::stdout().flush().ok();
-        let mut key_in = String::new();
-        io::stdin().read_line(&mut key_in).ok();
-        let key_in = key_in.trim().to_string();
+        if !provider.local {
+            let env_hint = provider.env_key.clone();
+            println!(
+                "\nEnter {} (optional). Leave empty to use env var {}.",
+                provider.name, env_hint
+            );
+            print!("{}: ", provider.name);
+            io::stdout().flush().ok();
+            let mut key_in = String::new();
+            io::stdin().read_line(&mut key_in).ok();
+            let key_in = key_in.trim().to_string();
 
-        if !key_in.is_empty() {
-            if let Some(mp) = cfg.model_providers.get_mut(&provider_key) {
-                mp.api_key = Some(key_in);
+            if !key_in.is_empty() {
+                if let Some(mp) = cfg.model_providers.get_mut(&provider_key) {
+                    mp.api_key = Some(key_in);
+                }
+            } else {
+                // No inline key; check if env is present and warn if missing.
+                if std::env::var(&env_hint).is_err() {
+                    println!(
+                        "Hint: export {}=YOUR_KEY (e.g., add to your shell profile).",
+                        env_hint
+                    );
+                }
             }
         } else {
-            // No inline key; check if env is present and warn if missing.
-            if std::env::var(&env_hint).is_err() {
-                println!(
-                    "Hint: export {}=YOUR_KEY (e.g., add to your shell profile).",
-                    env_hint
-                );
-            }
+            println!("\nLocal inference selected - no API key needed.");
+            println!("The model will be downloaded from HuggingFace on first use.");
         }
 
         println!("\nShare recent `qq` / `qa` commands with the model?");

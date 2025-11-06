@@ -23,9 +23,13 @@ futures-util = "0.3"
 bytes = "1.6"
 nu-ansi-term = "0.50"
 shell-words = "1.1"
+openvino = { version = "0.7", features = ["runtime-linking"], optional = true }
+tokenizers = { version = "0.20", optional = true }
+hf-hub = { version = "0.3", optional = true }
 
 [features]
-default = []
+default = ["local-inference"]
+local-inference = ["openvino", "tokenizers", "hf-hub"]
 
 [[bin]]
 name = "qq"
