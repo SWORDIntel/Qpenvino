@@ -4,6 +4,8 @@ use qqqa::ai::{ChatClient, Msg};
 use qqqa::config::{Config, InitExistsError};
 use qqqa::formatting::{print_assistant_text, print_stream_token, start_loading_animation};
 use qqqa::history::read_recent_history;
+#[cfg(feature = "local-inference")]
+use qqqa::local_inference::{InferenceDevice, LocalInferenceEngine, LocalModelConfig, ModelDownloader};
 use qqqa::prompt::{build_qq_system_prompt, build_qq_user_message};
 use std::io::{Read, Stdin};
 
@@ -124,9 +126,22 @@ async fn main() -> Result<()> {
     };
     if cli.debug {
         eprintln!(
-            "[debug] Using provider='{}' base_url='{}' model='{}'",
-            eff.provider_key, eff.base_url, eff.model
+            "[debug] Using provider='{}' base_url='{}' model='{}' local={}",
+            eff.provider_key, eff.base_url, eff.model, eff.local
         );
+    }
+
+    // Handle local inference if enabled
+    #[cfg(feature = "local-inference")]
+    if eff.local {
+        return run_local_inference(cli, cfg, eff, stdin_block, question).await;
+    }
+    #[cfg(not(feature = "local-inference"))]
+    if eff.local {
+        return Err(anyhow!(
+            "Local inference is not available. Rebuild with --features local-inference to enable it.\n\
+            Or use a remote provider: qq --profile groq <question>"
+        ));
     }
 
     // Read terminal history unless disabled.
@@ -236,4 +251,102 @@ fn read_all_stdin(mut stdin: Stdin) -> Result<String> {
     let mut buf = String::new();
     stdin.read_to_string(&mut buf)?;
     Ok(buf)
+}
+
+/// Run local inference using OpenVINO
+#[cfg(feature = "local-inference")]
+async fn run_local_inference(
+    cli: Cli,
+    cfg: Config,
+    eff: qqqa::config::EffectiveProfile,
+    stdin_block: Option<String>,
+    question: String,
+) -> Result<()> {
+    // Download model if needed
+    let downloader = ModelDownloader::new()?;
+    let repo_id = eff.repo_id.as_ref()
+        .ok_or_else(|| anyhow!("Local provider must specify repo_id in config"))?;
+
+    let model_dir = if let Some(cached) = downloader.get_cached_model(repo_id) {
+        if cli.debug {
+            eprintln!("[debug] Using cached model from {}", cached.display());
+        }
+        cached
+    } else {
+        println!("Downloading model '{}' from HuggingFace...", repo_id);
+        println!("This may take a few minutes on first use.\n");
+        downloader.download_model(repo_id).await?
+    };
+
+    // Determine device
+    let device_str = eff.device.as_deref().unwrap_or("NPU");
+    let device = InferenceDevice::from_str(device_str)?;
+
+    if cli.debug {
+        eprintln!("[debug] Loading model from {} on {}", model_dir.display(), device_str);
+    }
+
+    // Create inference engine
+    let config = LocalModelConfig::new(model_dir, device);
+    let engine = LocalInferenceEngine::new(config)?;
+
+    println!("Model loaded on {}\n", engine.device_info());
+
+    // Read terminal history unless disabled
+    let include_history = if cli.no_history {
+        false
+    } else if cli.history {
+        true
+    } else {
+        cfg.history_enabled()
+    };
+    let history = if include_history {
+        read_recent_history(10, cli.debug)
+    } else {
+        Vec::new()
+    };
+
+    // Build prompt
+    let mut system = build_qq_system_prompt();
+    if cfg.no_emoji_enabled() {
+        system.push_str("\nHard rule: You MUST NOT use emojis anywhere in the response.\n");
+    }
+    let user = build_qq_user_message(
+        Some(os_info::get().os_type()),
+        &history,
+        stdin_block.as_deref(),
+        &question,
+    );
+
+    // Combine system and user messages for local inference
+    let full_prompt = format!("{}\n\nUser: {}", system, user);
+
+    // Generate response
+    if cli.stream {
+        if cli.raw {
+            println!("");
+            engine.generate_stream(&full_prompt, |tok| {
+                print_stream_token(tok);
+            })?;
+            println!();
+        } else {
+            let mut buf = String::new();
+            engine.generate_stream(&full_prompt, |tok| {
+                buf.push_str(tok);
+            })?;
+            use qqqa::formatting::{render_xmlish_to_ansi, compact_blank_lines};
+            let rendered = render_xmlish_to_ansi(&buf);
+            let compacted = compact_blank_lines(&rendered);
+            println!("");
+            println!("{}", compacted.trim_end());
+        }
+    } else {
+        let loading = start_loading_animation();
+        let response = engine.generate(&full_prompt)?;
+        drop(loading);
+        println!("");
+        print_assistant_text(&response, cli.raw);
+    }
+
+    Ok(())
 }

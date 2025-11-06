@@ -112,9 +112,16 @@ async fn main() -> Result<()> {
     };
     if cli.debug {
         eprintln!(
-            "[debug] Using provider='{}' base_url='{}' model='{}'",
-            eff.provider_key, eff.base_url, eff.model
+            "[debug] Using provider='{}' base_url='{}' model='{}' local={}",
+            eff.provider_key, eff.base_url, eff.model, eff.local
         );
+    }
+
+    // Tool calling with local inference is not yet supported
+    if eff.local {
+        return Err(anyhow!(
+            "Local inference with tool calling (qa) is not yet supported.\nPlease use 'qq' for local inference, or switch to a remote provider for tool-based agents.\n\nTo use a remote provider, run:\n  qa --profile groq <task>\n  qa --profile openai <task>"
+        ));
     }
 
     let include_history = if cli.no_history {
