@@ -5,7 +5,7 @@
 #![cfg(feature = "local-inference")]
 
 use anyhow::{Context, Result, anyhow};
-use openvino::Core;
+use openvino::{Core, DeviceType, ElementType, Shape, Tensor};
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
@@ -116,66 +116,125 @@ impl LocalInferenceEngine {
             .encode(prompt, false)
             .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
 
-        let input_ids: Vec<u32> = encoding.get_ids().to_vec();
+        let mut input_ids: Vec<u32> = encoding.get_ids().to_vec();
 
         if input_ids.is_empty() {
             return Err(anyhow!("Tokenization produced empty input"));
         }
 
+        if cfg!(debug_assertions) {
+            eprintln!("✓ Tokenized {} tokens", input_ids.len());
+        }
+
         // Initialize OpenVINO Core
         let mut core = Core::new()?;
 
-        // Read and compile model
+        if cfg!(debug_assertions) {
+            eprintln!("✓ OpenVINO Core initialized");
+        }
+
+        // Read model
         let model_xml = self.model_path.to_string_lossy();
         let model_bin = self.model_path.with_extension("bin").to_string_lossy().to_string();
+        let model = core.read_model_from_file(&model_xml, &model_bin)?;
 
-        let _model = core.read_model_from_file(&model_xml, &model_bin)?;
+        if cfg!(debug_assertions) {
+            eprintln!("✓ Model loaded from {}", model_xml);
+        }
 
-        // TODO: Complete the implementation with proper OpenVINO API calls
-        // The OpenVINO Rust API v0.7 has specific method signatures that need to be matched.
-        // Key steps needed:
-        // 1. Compile model: compiled_model = core.compile_model(&model, "CPU")?
-        // 2. Create infer request: infer_request = compiled_model.create_infer_request()?
-        // 3. Set input tensor with proper shape and data
-        // 4. Run inference: infer_request.infer()?
-        // 5. Get output tensor and extract logits
-        // 6. Implement autoregressive loop with token sampling
-        //
-        // For now, return a helpful message showing the integration is partially complete.
+        // Select device
+        let device = match self.config.device {
+            InferenceDevice::CPU => DeviceType::CPU,
+            InferenceDevice::GPU => DeviceType::GPU,
+            InferenceDevice::NPU => DeviceType::NPU,
+        };
 
-        eprintln!("✓ OpenVINO Core initialized");
-        eprintln!("✓ Model loaded: {}", model_xml);
-        eprintln!("✓ Tokenized {} tokens", input_ids.len());
-        eprintln!("✓ Device: {}", self.config.device.as_str());
+        if cfg!(debug_assertions) {
+            eprintln!("✓ Compiling for {:?}", self.config.device);
+        }
 
-        Ok(format!(
-            "OpenVINO inference framework initialized successfully!\n\n\
-            ✅ Model: {}\n\
-            ✅ Device: {}\n\
-            ✅ Tokenizer: {} tokens\n\
-            ✅ EOS token: {}\n\n\
-            🚧 Autoregressive generation loop implementation in progress.\n\n\
-            The OpenVINO Rust bindings (v0.7) require specific API calls that are being finalized.\n\
-            Key infrastructure is complete:\n\
-            - Model loading ✓\n\
-            - Tokenization ✓\n\
-            - Device selection ✓\n\n\
-            What's needed:\n\
-            - Tensor creation and data copying with correct API\n\
-            - Inference request execution\n\
-            - Logits extraction and token sampling\n\
-            - Autoregressive generation loop\n\n\
-            Your prompt was: \"{}\"\n\n\
-            For production use, please use remote providers:\n\
-            • qq --profile groq \"your question\"\n\
-            • qq --profile openai \"your question\"\n\n\
-            See src/local_inference.rs for implementation details.",
-            self.model_path.display(),
-            self.config.device.as_str(),
-            input_ids.len(),
-            self.eos_token_id,
-            prompt
-        ))
+        // Compile model
+        let mut compiled_model = core.compile_model(&model, device)?;
+
+        if cfg!(debug_assertions) {
+            eprintln!("✓ Model compiled successfully");
+        }
+
+        // Create inference request
+        let mut infer_request = compiled_model.create_infer_request()?;
+
+        // Autoregressive generation loop
+        let mut generated_tokens = Vec::new();
+        let max_new_tokens = self.config.max_tokens.min(512);
+
+        for step in 0..max_new_tokens {
+            // Prepare input tensor
+            let seq_len = input_ids.len();
+            let shape = Shape::new(&[1, seq_len as i64])?;
+            let mut input_tensor = Tensor::new(ElementType::I64, &shape)?;
+
+            // Copy token IDs to tensor
+            {
+                let data = input_tensor.get_data_mut::<i64>()?;
+                for (i, &token_id) in input_ids.iter().enumerate() {
+                    data[i] = token_id as i64;
+                }
+            }
+
+            // Set input and run inference
+            infer_request.set_input_tensor(&input_tensor)?;
+            infer_request.infer()?;
+
+            // Get output tensor
+            let output_tensor = infer_request.get_output_tensor()?;
+            let output_shape = output_tensor.get_shape()?;
+            let dims = output_shape.get_dimensions();
+
+            // Output shape is [batch_size, seq_len, vocab_size]
+            if dims.len() != 3 {
+                return Err(anyhow!("Unexpected output shape: expected 3 dimensions, got {}", dims.len()));
+            }
+
+            let _batch_size = dims[0] as usize;
+            let output_seq_len = dims[1] as usize;
+            let vocab_size = dims[2] as usize;
+
+            // Get logits for the last token
+            let output_data = output_tensor.get_data::<f32>()?;
+            let last_token_offset = (output_seq_len - 1) * vocab_size;
+            let logits = &output_data[last_token_offset..last_token_offset + vocab_size];
+
+            // Sample next token
+            let next_token = self.sample_token(logits)?;
+
+            // Check for EOS
+            if next_token == self.eos_token_id {
+                if cfg!(debug_assertions) {
+                    eprintln!("✓ Generated {} tokens (EOS reached)", step);
+                }
+                break;
+            }
+
+            // Add to generated sequence
+            generated_tokens.push(next_token);
+            input_ids.push(next_token);
+
+            // Progress indicator
+            if cfg!(debug_assertions) && step > 0 && step % 10 == 0 {
+                eprintln!("  Generated {} tokens...", step);
+            }
+        }
+
+        if cfg!(debug_assertions) {
+            eprintln!("✓ Generation complete: {} tokens", generated_tokens.len());
+        }
+
+        // Decode generated tokens
+        let response = self.tokenizer
+            .decode(&generated_tokens, true)
+            .map_err(|e| anyhow!("Decoding failed: {}", e))?;
+
+        Ok(response)
     }
 
     /// Sample the next token from logits (greedy or temperature sampling)
@@ -205,16 +264,96 @@ impl LocalInferenceEngine {
         // }
     }
 
-    /// Generate text with streaming callback
-    /// Currently calls the non-streaming generate and returns all text at once
+    /// Generate text with streaming callback - calls callback for each generated token
     pub fn generate_stream<F>(&self, prompt: &str, mut callback: F) -> Result<()>
     where
         F: FnMut(&str),
     {
-        // TODO: Implement true token-by-token streaming once autoregressive loop is complete
-        // For now, generate all text and call callback once
-        let response = self.generate(prompt)?;
-        callback(&response);
+        // Tokenize input
+        let encoding = self.tokenizer
+            .encode(prompt, false)
+            .map_err(|e| anyhow!("Tokenization failed: {}", e))?;
+
+        let mut input_ids: Vec<u32> = encoding.get_ids().to_vec();
+
+        if input_ids.is_empty() {
+            return Err(anyhow!("Tokenization produced empty input"));
+        }
+
+        // Initialize OpenVINO Core
+        let mut core = Core::new()?;
+        let model_xml = self.model_path.to_string_lossy();
+        let model_bin = self.model_path.with_extension("bin").to_string_lossy().to_string();
+        let model = core.read_model_from_file(&model_xml, &model_bin)?;
+
+        // Select device
+        let device = match self.config.device {
+            InferenceDevice::CPU => DeviceType::CPU,
+            InferenceDevice::GPU => DeviceType::GPU,
+            InferenceDevice::NPU => DeviceType::NPU,
+        };
+
+        // Compile model and create inference request
+        let mut compiled_model = core.compile_model(&model, device)?;
+        let mut infer_request = compiled_model.create_infer_request()?;
+
+        // Streaming generation loop
+        let max_new_tokens = self.config.max_tokens.min(512);
+
+        for _step in 0..max_new_tokens {
+            // Prepare input tensor
+            let seq_len = input_ids.len();
+            let shape = Shape::new(&[1, seq_len as i64])?;
+            let mut input_tensor = Tensor::new(ElementType::I64, &shape)?;
+
+            // Copy token IDs to tensor
+            {
+                let data = input_tensor.get_data_mut::<i64>()?;
+                for (i, &token_id) in input_ids.iter().enumerate() {
+                    data[i] = token_id as i64;
+                }
+            }
+
+            // Set input and run inference
+            infer_request.set_input_tensor(&input_tensor)?;
+            infer_request.infer()?;
+
+            // Get output tensor
+            let output_tensor = infer_request.get_output_tensor()?;
+            let output_shape = output_tensor.get_shape()?;
+            let dims = output_shape.get_dimensions();
+
+            if dims.len() != 3 {
+                return Err(anyhow!("Unexpected output shape"));
+            }
+
+            let output_seq_len = dims[1] as usize;
+            let vocab_size = dims[2] as usize;
+
+            // Get logits for the last token
+            let output_data = output_tensor.get_data::<f32>()?;
+            let last_token_offset = (output_seq_len - 1) * vocab_size;
+            let logits = &output_data[last_token_offset..last_token_offset + vocab_size];
+
+            // Sample next token
+            let next_token = self.sample_token(logits)?;
+
+            // Check for EOS
+            if next_token == self.eos_token_id {
+                break;
+            }
+
+            // Decode and stream this single token
+            let token_text = self.tokenizer
+                .decode(&[next_token], false)
+                .map_err(|e| anyhow!("Token decoding failed: {}", e))?;
+
+            callback(&token_text);
+
+            // Add to sequence for next iteration
+            input_ids.push(next_token);
+        }
+
         Ok(())
     }
 
